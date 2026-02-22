@@ -24,9 +24,25 @@ CWD=$(echo "$INPUT" | jq -r '.cwd // "unknown"')
 
 log "Parsing transcript: $TRANSCRIPT_PATH ($(wc -l < "$TRANSCRIPT_PATH") lines)"
 
+# Optional: Wayfound Application ID for multi-agent tracing.
+# When set, all sessions (orchestrator + subagents) are linked via
+# applicationId, trace_id, span_id, and parent_span_id.
+APPLICATION_ID="${WAYFOUND_APPLICATION_ID:-}"
+if [ -n "$APPLICATION_ID" ]; then
+  log "Application tracing enabled: $APPLICATION_ID"
+fi
+
 # Wayfound messages payload max is 750KB. Reserve 50KB for envelope/metadata.
 MAX_MESSAGES_BYTES=700000
 FIELD_LIMIT=20000
+
+# Generate a random 16-char hex span ID
+generate_span_id() {
+  openssl rand -hex 8
+}
+
+# Orchestrator span ID (used as parent_span_id by subagents)
+ORCHESTRATOR_SPAN_ID=$(generate_span_id)
 
 # ---------------------------------------------------------------------------
 # Resolve per-subagent Wayfound agent IDs.
@@ -232,13 +248,15 @@ for f in "$TRANSCRIPT_DIR"/agent-*.jsonl; do
 
   if [ -n "$SUBAGENT_WF_ID" ]; then
     # Route to separate Wayfound session
-    log "Routing $AGENT_NAME to separate Wayfound agent $SUBAGENT_WF_ID"
+    SUB_SPAN_ID=$(generate_span_id)
+    log "Routing $AGENT_NAME to separate Wayfound agent $SUBAGENT_WF_ID (span: $SUB_SPAN_ID)"
     SUB_EVENTS=$(parse_subagent_transcript "$f" "full" "$FIELD_LIMIT" "$AGENT_NAME")
     SEPARATE_AGENT_SESSIONS=$(echo "$SEPARATE_AGENT_SESSIONS" | jq \
       --arg agent_id "$SUBAGENT_WF_ID" \
       --arg agent_name "$AGENT_NAME" \
+      --arg span_id "$SUB_SPAN_ID" \
       --argjson events "$SUB_EVENTS" \
-      '. + [{agent_id: $agent_id, agent_name: $agent_name, events: $events}]')
+      '. + [{agent_id: $agent_id, agent_name: $agent_name, span_id: $span_id, events: $events}]')
   else
     # Inline into orchestrator session
     SUB_EVENTS=$(parse_subagent_transcript "$f" "internal" "$FIELD_LIMIT" "$AGENT_NAME")
@@ -393,27 +411,67 @@ generate_events() {
 }
 
 # ---------------------------------------------------------------------------
-# Post a session to Wayfound. Args: $1=agent_id, $2=events_json, $3=metadata_json
+# Add tracing context (trace_id, span_id, parent_span_id) to every event.
+# Only applied when WAYFOUND_APPLICATION_ID is set.
+# ---------------------------------------------------------------------------
+add_tracing_context() {
+  local events=$1
+  local trace_id=$2
+  local span_id=$3
+  local parent_span_id=${4:-}
+
+  if [ -n "$parent_span_id" ]; then
+    echo "$events" | jq --arg tid "$trace_id" --arg sid "$span_id" --arg psid "$parent_span_id" '
+      map(. + { context: { trace_id: $tid, span_id: $sid, parent_span_id: $psid } })
+    '
+  else
+    echo "$events" | jq --arg tid "$trace_id" --arg sid "$span_id" '
+      map(. + { context: { trace_id: $tid, span_id: $sid } })
+    '
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Post a session to Wayfound.
+# Args: $1=agent_id $2=events_json $3=metadata_json [$4=application_id]
 # ---------------------------------------------------------------------------
 post_session() {
   local agent_id=$1
   local events=$2
   local metadata=$3
+  local app_id=${4:-}
 
   local events_size
   events_size=$(echo "$events" | wc -c | tr -d ' ')
 
-  # If over budget, shrink field limit proportionally and regenerate
-  # (only applies to main session; subagent sessions are smaller)
   if [ "$events_size" -gt "$MAX_MESSAGES_BYTES" ]; then
     log "WARNING: payload for $agent_id is ${events_size} bytes, exceeds limit"
   fi
 
-  local response
-  response=$(curl -s -w "\n%{http_code}" -X POST "https://app.wayfound.ai/api/v2/sessions" \
-    -H "Authorization: Bearer ${WAYFOUND_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "$(jq -n \
+  # Extract firstMessageAt / lastMessageAt from events
+  local first_ts last_ts
+  first_ts=$(echo "$events" | jq -r '.[0].timestamp // empty')
+  last_ts=$(echo "$events" | jq -r '.[-1].timestamp // empty')
+
+  local payload
+  if [ -n "$app_id" ]; then
+    payload=$(jq -n \
+      --arg agent_id "$agent_id" \
+      --arg app_id "$app_id" \
+      --argjson messages "$events" \
+      --argjson metadata "$metadata" \
+      --arg first "$first_ts" \
+      --arg last "$last_ts" \
+      '{
+        agentId: $agent_id,
+        applicationId: $app_id,
+        metadata: $metadata,
+        messages: $messages,
+        firstMessageAt: $first,
+        lastMessageAt: $last
+      }')
+  else
+    payload=$(jq -n \
       --arg agent_id "$agent_id" \
       --argjson messages "$events" \
       --argjson metadata "$metadata" \
@@ -421,8 +479,14 @@ post_session() {
         agentId: $agent_id,
         metadata: $metadata,
         messages: $messages
-      }'
-    )")
+      }')
+  fi
+
+  local response
+  response=$(curl -s -w "\n%{http_code}" -X POST "https://app.wayfound.ai/api/v2/sessions" \
+    -H "Authorization: Bearer ${WAYFOUND_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$payload")
 
   local http_code body
   http_code=$(echo "$response" | tail -1)
@@ -448,6 +512,14 @@ if [ "$EVENTS_SIZE" -gt "$MAX_MESSAGES_BYTES" ]; then
   log "After truncation: ${EVENTS_SIZE} bytes"
 fi
 
+# Add tracing context if application tracing is enabled
+# trace_id = SDK session ID (shared across all agents in this run)
+# span_id = unique per session (orchestrator gets its own)
+if [ -n "$APPLICATION_ID" ]; then
+  EVENTS=$(add_tracing_context "$EVENTS" "$SESSION_ID" "$ORCHESTRATOR_SPAN_ID")
+  log "Added tracing context: trace=$SESSION_ID span=$ORCHESTRATOR_SPAN_ID"
+fi
+
 EVENT_COUNT=$(echo "$EVENTS" | jq 'length')
 log "Generated $EVENT_COUNT events for orchestrator session"
 
@@ -460,7 +532,7 @@ MAIN_METADATA=$(jq -n \
     cwd: $cwd
   }')
 
-post_session "$WAYFOUND_AGENT_ID" "$EVENTS" "$MAIN_METADATA"
+post_session "$WAYFOUND_AGENT_ID" "$EVENTS" "$MAIN_METADATA" "$APPLICATION_ID"
 
 # ---------------------------------------------------------------------------
 # Post separate subagent sessions (if any).
@@ -469,7 +541,16 @@ SEPARATE_COUNT=$(echo "$SEPARATE_AGENT_SESSIONS" | jq 'length')
 for (( i=0; i<SEPARATE_COUNT; i++ )); do
   SUB_AGENT_ID=$(echo "$SEPARATE_AGENT_SESSIONS" | jq -r ".[$i].agent_id")
   SUB_AGENT_NAME=$(echo "$SEPARATE_AGENT_SESSIONS" | jq -r ".[$i].agent_name")
+  SUB_SPAN_ID=$(echo "$SEPARATE_AGENT_SESSIONS" | jq -r ".[$i].span_id")
   SUB_EVENTS=$(echo "$SEPARATE_AGENT_SESSIONS" | jq ".[$i].events")
+
+  # Add tracing context if application tracing is enabled
+  # Subagent sessions share the same trace_id but have their own span_id
+  # and set parent_span_id to the orchestrator's span
+  if [ -n "$APPLICATION_ID" ]; then
+    SUB_EVENTS=$(add_tracing_context "$SUB_EVENTS" "$SESSION_ID" "$SUB_SPAN_ID" "$ORCHESTRATOR_SPAN_ID")
+    log "Added tracing context for $SUB_AGENT_NAME: trace=$SESSION_ID span=$SUB_SPAN_ID parent=$ORCHESTRATOR_SPAN_ID"
+  fi
 
   SUB_EVENT_COUNT=$(echo "$SUB_EVENTS" | jq 'length')
   log "Posting $SUB_EVENT_COUNT events for subagent $SUB_AGENT_NAME → agent $SUB_AGENT_ID"
@@ -486,7 +567,7 @@ for (( i=0; i<SEPARATE_COUNT; i++ )); do
       parent_session_id: $sdk_session_id
     }')
 
-  post_session "$SUB_AGENT_ID" "$SUB_EVENTS" "$SUB_METADATA"
+  post_session "$SUB_AGENT_ID" "$SUB_EVENTS" "$SUB_METADATA" "$APPLICATION_ID"
 done
 
 exit 0

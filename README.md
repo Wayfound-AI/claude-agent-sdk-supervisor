@@ -30,10 +30,11 @@ The plugin hooks fire automatically. No other code changes are needed.
 
 Set two environment variables:
 
-| Variable            | Required | Description                                  |
-| ------------------- | -------- | -------------------------------------------- |
-| `WAYFOUND_API_KEY`  | Yes      | Your Wayfound API key (used as Bearer token) |
-| `WAYFOUND_AGENT_ID` | Yes      | Wayfound agent ID to associate sessions with |
+| Variable                  | Required | Description                                                    |
+| ------------------------- | -------- | -------------------------------------------------------------- |
+| `WAYFOUND_API_KEY`        | Yes      | Your Wayfound API key (used as Bearer token)                   |
+| `WAYFOUND_AGENT_ID`       | Yes      | Wayfound agent ID to associate sessions with                   |
+| `WAYFOUND_APPLICATION_ID` | No       | Wayfound Application ID for multi-agent tracing (see below)    |
 
 You can set these in a `.env` file at your project root or export them directly.
 
@@ -48,6 +49,16 @@ WAYFOUND_AGENT_ID_RATINGS_RESEARCHER=ghi789       # ratings-researcher → separ
 ```
 
 The orchestrator's session always retains `Agent Call` and `Agent Result` events for every subagent, regardless of routing.
+
+### Application tracing (optional)
+
+To visualize multi-agent sessions as a unified trace in [Wayfound Applications](https://docs.wayfound.ai/applications/supervise-multi-agent-systems), set `WAYFOUND_APPLICATION_ID`:
+
+```bash
+WAYFOUND_APPLICATION_ID=your-application-id-here
+```
+
+When set, every event gets a `context` block with `trace_id`, `span_id`, and `parent_span_id` (for subagents). All sessions in a single run share the same `trace_id` (the SDK session ID), so Wayfound can correlate them in the Application timeline.
 
 ## How It Works
 
