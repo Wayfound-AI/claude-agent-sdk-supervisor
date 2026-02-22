@@ -1,0 +1,5 @@
+{
+  "name": "claude-agent-sdk-supervisor",
+  "description": "Sends Claude Agent SDK session events to Wayfound for analysis",
+  "version": "0.1.0"
+}

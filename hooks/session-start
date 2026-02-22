@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG="/tmp/wayfound-debug.log"
+log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [session-start] $*" >> "$LOG"; }
+
+log "Script started"
+log "WAYFOUND_API_KEY=${WAYFOUND_API_KEY:+set (${#WAYFOUND_API_KEY} chars)}"
+log "WAYFOUND_AGENT_ID=${WAYFOUND_AGENT_ID:-unset}"
+
+# Exit silently if not configured
+[[ -z "${WAYFOUND_API_KEY:-}" || -z "${WAYFOUND_AGENT_ID:-}" ]] && { log "Missing env vars, exiting"; exit 0; }
+
+# Read hook input from stdin
+INPUT=$(cat)
+log "Received stdin: $(echo "$INPUT" | head -c 500)"
+
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+[[ -z "$SESSION_ID" ]] && { log "No session_id found, exiting"; exit 0; }
+log "SESSION_ID=$SESSION_ID"
+
+log "Session started (transcript will be processed at session end)"
+
+exit 0

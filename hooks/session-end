@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG="/tmp/wayfound-debug.log"
+log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] [session-end] $*" >> "$LOG"; }
+
+log "Script started"
+
+# Exit silently if not configured
+[[ -z "${WAYFOUND_API_KEY:-}" || -z "${WAYFOUND_AGENT_ID:-}" ]] && { log "Missing env vars, exiting"; exit 0; }
+
+# Read hook input from stdin
+INPUT=$(cat)
+
+SESSION_ID=$(echo "$INPUT" | jq -r '.session_id // empty')
+[[ -z "$SESSION_ID" ]] && { log "No session_id found, exiting"; exit 0; }
+log "SESSION_ID=$SESSION_ID"
+
+TRANSCRIPT_PATH=$(echo "$INPUT" | jq -r '.transcript_path // empty')
+[[ -z "$TRANSCRIPT_PATH" || ! -f "$TRANSCRIPT_PATH" ]] && { log "No transcript at ${TRANSCRIPT_PATH:-<empty>}, exiting"; exit 0; }
+
+REASON=$(echo "$INPUT" | jq -r '.reason // "completed"')
+CWD=$(echo "$INPUT" | jq -r '.cwd // "unknown"')
+
+log "Parsing transcript: $TRANSCRIPT_PATH ($(wc -l < "$TRANSCRIPT_PATH") lines)"
+
+# Wayfound messages payload max is 750KB. Reserve 50KB for envelope/metadata.
+MAX_MESSAGES_BYTES=700000
+FIELD_LIMIT=20000
+
+# Parse transcript JSONL into Wayfound events.
+# Each transcript line has: type, timestamp, message.content[]
+#   type: "queue-operation"  → skip
+#   type: "user"   + text content     → user_message
+#   type: "user"   + tool_result      → tool_call (result, paired with preceding tool_use)
+#   type: "assistant" + text content   → assistant_message
+#   type: "assistant" + tool_use       → tool_call (invocation)
+generate_events() {
+  local limit=$1
+  jq -s --argjson limit "$limit" --arg reason "$REASON" '
+    reduce .[] as $line (
+      {events: [], tool_uses: {}};
+
+      if $line.type == "queue-operation" then .
+
+      # User messages — content is always an array under .message.content
+      elif $line.type == "user" then
+        reduce ($line.message.content // [])[] as $item (.;
+          if $item.type == "text" then
+            .events += [{
+              timestamp: $line.timestamp,
+              event_type: "user_message",
+              label: "User Message",
+              description: "User prompt",
+              attributes: { content: ($item.text | .[0:$limit]) }
+            }]
+          elif $item.type == "tool_result" then
+            (.tool_uses[$item.tool_use_id] // {}) as $tu |
+            .events += [{
+              timestamp: $line.timestamp,
+              event_type: "tool_call",
+              label: ("Tool Result: " + ($tu.name // "unknown")),
+              description: ("Result from " + ($tu.name // "unknown")),
+              attributes: {
+                tool_name: ($tu.name // "unknown"),
+                tool_use_id: $item.tool_use_id,
+                tool_output: (($item.content | tostring) | .[0:$limit]),
+                success: true
+              }
+            }]
+          else . end
+        )
+
+      # Assistant messages — text and/or tool_use blocks under .message.content
+      elif $line.type == "assistant" then
+        reduce ($line.message.content // [])[] as $item (.;
+          if $item.type == "text" then
+            .events += [{
+              timestamp: $line.timestamp,
+              event_type: "assistant_message",
+              label: "Assistant Message",
+              description: "Assistant response",
+              attributes: { content: ($item.text | .[0:$limit]) }
+            }]
+          elif $item.type == "tool_use" then
+            .tool_uses[$item.id] = {name: $item.name, input: $item.input}
+            | .events += [{
+              timestamp: $line.timestamp,
+              event_type: "tool_call",
+              label: ("Tool Call: " + $item.name),
+              description: ("Executing " + $item.name),
+              attributes: {
+                tool_name: $item.name,
+                tool_use_id: $item.id,
+                tool_input: (($item.input | tojson) | .[0:$limit]),
+                success: true
+              }
+            }]
+          else . end
+        )
+
+      else . end
+    )
+    # Bookend with session start/end system_message events
+    | (.events[0].timestamp // (now | todate)) as $start_ts
+    | (.events[-1].timestamp // (now | todate)) as $end_ts
+    | [{
+        timestamp: $start_ts,
+        event_type: "system_message",
+        label: "Session Started",
+        description: "Claude Agent SDK session started",
+        attributes: { content: "Session initialized" }
+      }]
+      + .events
+      + [{
+        timestamp: $end_ts,
+        event_type: "system_message",
+        label: "Session Ended",
+        description: "Session completed",
+        attributes: { content: "Session ended", reason: $reason }
+      }]
+  ' "$TRANSCRIPT_PATH"
+}
+
+EVENTS=$(generate_events "$FIELD_LIMIT")
+EVENTS_SIZE=$(echo "$EVENTS" | wc -c | tr -d ' ')
+log "Events payload: ${EVENTS_SIZE} bytes (limit: ${MAX_MESSAGES_BYTES}, field_limit: ${FIELD_LIMIT})"
+
+# If over budget, shrink field limit proportionally and regenerate
+if [ "$EVENTS_SIZE" -gt "$MAX_MESSAGES_BYTES" ]; then
+  FIELD_LIMIT=$(( FIELD_LIMIT * MAX_MESSAGES_BYTES / EVENTS_SIZE ))
+  [ "$FIELD_LIMIT" -lt 500 ] && FIELD_LIMIT=500
+  log "Over budget, retrying with field_limit=${FIELD_LIMIT}"
+  EVENTS=$(generate_events "$FIELD_LIMIT")
+  EVENTS_SIZE=$(echo "$EVENTS" | wc -c | tr -d ' ')
+  log "After truncation: ${EVENTS_SIZE} bytes"
+fi
+
+EVENT_COUNT=$(echo "$EVENTS" | jq 'length')
+log "Generated $EVENT_COUNT events from transcript"
+
+# Single POST to Wayfound with all events
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://app.wayfound.ai/api/v2/sessions" \
+  -H "Authorization: Bearer ${WAYFOUND_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "$(jq -n \
+    --arg agent_id "$WAYFOUND_AGENT_ID" \
+    --arg sdk_session_id "$SESSION_ID" \
+    --arg cwd "$CWD" \
+    --argjson messages "$EVENTS" \
+    '{
+      agentId: $agent_id,
+      metadata: {
+        sdk_session_id: $sdk_session_id,
+        source: "claude-agent-sdk",
+        cwd: $cwd
+      },
+      messages: $messages
+    }'
+  )")
+
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | sed '$d')
+log "POST response: HTTP $HTTP_CODE"
+log "Response body: $(echo "$BODY" | head -c 500)"
+
+exit 0

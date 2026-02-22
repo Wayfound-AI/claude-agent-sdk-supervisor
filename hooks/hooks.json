@@ -1,0 +1,27 @@
+{
+  "description": "Wayfound plugin - sends session events to Wayfound for analysis",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd' session-start",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'${CLAUDE_PLUGIN_ROOT}/hooks/run-hook.cmd' session-end",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
+}
