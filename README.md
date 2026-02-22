@@ -28,7 +28,7 @@ The plugin hooks fire automatically. No other code changes are needed.
 
 ## Configuration
 
-Set two environment variables:
+Set the following environment variables:
 
 | Variable                  | Required | Description                                                    |
 | ------------------------- | -------- | -------------------------------------------------------------- |
