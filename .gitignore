@@ -3,4 +3,5 @@ dist/
 .claude/
 .env
 .env.*
+!.env.example
 *_research_report*.md
