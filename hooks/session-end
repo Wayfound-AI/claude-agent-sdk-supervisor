@@ -32,9 +32,9 @@ FIELD_LIMIT=20000
 # Each transcript line has: type, timestamp, message.content[]
 #   type: "queue-operation"  → skip
 #   type: "user"   + text content     → user_message
-#   type: "user"   + tool_result      → tool_call (result, paired with preceding tool_use)
+#   type: "user"   + tool_result      → tool_call result (or agent_call result for Task)
 #   type: "assistant" + text content   → assistant_message
-#   type: "assistant" + tool_use       → tool_call (invocation)
+#   type: "assistant" + tool_use       → tool_call (or agent_call if tool name is "Task")
 generate_events() {
   local limit=$1
   jq -s --argjson limit "$limit" --arg reason "$REASON" '
@@ -56,18 +56,32 @@ generate_events() {
             }]
           elif $item.type == "tool_result" then
             (.tool_uses[$item.tool_use_id] // {}) as $tu |
-            .events += [{
-              timestamp: $line.timestamp,
-              event_type: "tool_call",
-              label: ("Tool Result: " + ($tu.name // "unknown")),
-              description: ("Result from " + ($tu.name // "unknown")),
-              attributes: {
-                tool_name: ($tu.name // "unknown"),
-                tool_use_id: $item.tool_use_id,
-                tool_output: (($item.content | tostring) | .[0:$limit]),
-                success: true
-              }
-            }]
+            if $tu.is_agent then
+              .events += [{
+                timestamp: $line.timestamp,
+                event_type: "agent_call",
+                label: ("Agent Result: " + ($tu.agent_name // "unknown")),
+                description: ("Result from subagent " + ($tu.agent_name // "unknown")),
+                attributes: {
+                  external_id: ($tu.agent_name // "unknown"),
+                  tool_use_id: $item.tool_use_id,
+                  output: (($item.content | tostring) | .[0:$limit])
+                }
+              }]
+            else
+              .events += [{
+                timestamp: $line.timestamp,
+                event_type: "tool_call",
+                label: ("Tool Result: " + ($tu.name // "unknown")),
+                description: ("Result from " + ($tu.name // "unknown")),
+                attributes: {
+                  tool_name: ($tu.name // "unknown"),
+                  tool_use_id: $item.tool_use_id,
+                  tool_output: (($item.content | tostring) | .[0:$limit]),
+                  success: true
+                }
+              }]
+            end
           else . end
         )
 
@@ -82,8 +96,25 @@ generate_events() {
               description: "Assistant response",
               attributes: { content: ($item.text | .[0:$limit]) }
             }]
+          elif $item.type == "tool_use" and $item.name == "Task" then
+            # Subagent invocation — use agent_call event type
+            ($item.input.subagent_type // $item.input.name // "unknown") as $agent_name |
+            .tool_uses[$item.id] = {name: "Task", is_agent: true, agent_name: $agent_name, input: $item.input}
+            | .events += [{
+              timestamp: $line.timestamp,
+              event_type: "agent_call",
+              label: ("Agent Call: " + $agent_name),
+              description: ($item.input.description // ("Invoking subagent " + $agent_name)),
+              attributes: {
+                external_id: $agent_name,
+                input: (
+                  { prompt: (($item.input.prompt // "") | .[0:$limit]) }
+                  + (if $item.input.description then {description: $item.input.description} else {} end)
+                )
+              }
+            }]
           elif $item.type == "tool_use" then
-            .tool_uses[$item.id] = {name: $item.name, input: $item.input}
+            .tool_uses[$item.id] = {name: $item.name, is_agent: false, input: $item.input}
             | .events += [{
               timestamp: $line.timestamp,
               event_type: "tool_call",

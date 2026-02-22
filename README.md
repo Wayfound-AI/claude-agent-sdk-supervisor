@@ -60,3 +60,4 @@ If `WAYFOUND_API_KEY` or `WAYFOUND_AGENT_ID` are not set, all hooks exit silentl
 See the [`examples/`](./examples/) directory for working examples:
 
 - **[single-agent](./examples/single-agent/)** — Stock research CLI that uses the Wayfound plugin with the Claude Agent SDK
+- **[multi-agent](./examples/multi-agent/)** — Multi-agent stock research using subagents (news researcher + ratings researcher) coordinated by an orchestrator
