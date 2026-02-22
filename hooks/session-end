@@ -29,6 +29,28 @@ MAX_MESSAGES_BYTES=700000
 FIELD_LIMIT=20000
 
 # ---------------------------------------------------------------------------
+# Resolve per-subagent Wayfound agent IDs.
+#
+# Users can route each subagent's session to its own Wayfound supervisor by
+# setting WAYFOUND_AGENT_ID_<NAME> where <NAME> is the subagent name in
+# uppercase with hyphens replaced by underscores. For example:
+#
+#   WAYFOUND_AGENT_ID=abc123                      # orchestrator
+#   WAYFOUND_AGENT_ID_NEWS_RESEARCHER=def456      # news-researcher
+#   WAYFOUND_AGENT_ID_RATINGS_RESEARCHER=ghi789   # ratings-researcher
+#
+# If set, that subagent's internal events are sent as a separate Wayfound
+# session (to the specified agent ID) instead of being inlined into the
+# orchestrator's session. The orchestrator always keeps Agent Call / Agent
+# Result events regardless.
+# ---------------------------------------------------------------------------
+resolve_agent_id() {
+  local subagent_name=$1
+  local env_name="WAYFOUND_AGENT_ID_$(echo "$subagent_name" | tr '[:lower:]-' '[:upper:]_')"
+  echo "${!env_name:-}"
+}
+
+# ---------------------------------------------------------------------------
 # Collect subagent transcripts and pre-parse their internal events.
 #
 # Subagent transcript files live alongside the main transcript as agent-*.jsonl.
@@ -36,13 +58,153 @@ FIELD_LIMIT=20000
 # orchestrator sent. We key on the first 200 chars of that prompt so we can
 # correlate each file with the Task tool_use that spawned it.
 #
-# The result is SUBAGENT_EVENTS_MAP: a JSON object keyed by prompt_key, where
-# each value is an array of Wayfound events representing the subagent's internal
-# work (tool calls, reasoning, results — excluding the initial prompt and final
-# summary which are already captured in Agent Call / Agent Result).
+# Subagents WITHOUT a dedicated agent ID go into SUBAGENT_EVENTS_MAP (inlined
+# into the orchestrator session). Subagents WITH a dedicated agent ID go into
+# SEPARATE_AGENT_SESSIONS (posted as their own Wayfound sessions).
 # ---------------------------------------------------------------------------
 TRANSCRIPT_DIR=$(dirname "$TRANSCRIPT_PATH")
 SUBAGENT_EVENTS_MAP="{}"
+SEPARATE_AGENT_SESSIONS="[]"
+
+# Parse a subagent transcript into Wayfound events.
+# When $2 = "internal", strips first/last lines (for inlining, uses PLACEHOLDER_LABEL).
+# When $2 = "full", includes all lines with proper labels (for separate sessions).
+parse_subagent_transcript() {
+  local agent_file=$1
+  local mode=$2
+  local limit=$3
+  local agent_name=$4
+
+  if [ "$mode" = "internal" ]; then
+    jq -s --argjson limit "$limit" '
+      .[1:-1]
+      | reduce .[] as $line (
+          [];
+          if $line.type == "assistant" then
+            reduce ($line.message.content // [])[] as $item (.;
+              if $item.type == "text" then
+                . + [{
+                  timestamp: $line.timestamp,
+                  event_type: "assistant_message",
+                  label: "PLACEHOLDER_LABEL Reasoning",
+                  description: "PLACEHOLDER_LABEL internal reasoning",
+                  attributes: { content: ($item.text | .[0:$limit]) }
+                }]
+              elif $item.type == "tool_use" then
+                . + [{
+                  timestamp: $line.timestamp,
+                  event_type: "tool_call",
+                  label: ("PLACEHOLDER_LABEL " + $item.name),
+                  description: ("PLACEHOLDER_LABEL called " + $item.name),
+                  attributes: {
+                    tool_name: $item.name,
+                    tool_use_id: $item.id,
+                    tool_input: (($item.input | tojson) | .[0:$limit]),
+                    success: true
+                  }
+                }]
+              else . end
+            )
+          elif $line.type == "user" then
+            reduce ($line.message.content // [])[] as $item (.;
+              if $item.type == "tool_result" then
+                . + [{
+                  timestamp: $line.timestamp,
+                  event_type: "tool_call",
+                  label: "PLACEHOLDER_LABEL Tool Result",
+                  description: "PLACEHOLDER_LABEL received tool result",
+                  attributes: {
+                    tool_use_id: $item.tool_use_id,
+                    tool_output: (($item.content | tostring) | .[0:$limit]),
+                    success: true
+                  }
+                }]
+              else . end
+            )
+          else . end
+        )
+    ' "$agent_file"
+  else
+    # Full mode: parse entire transcript with proper labels for a standalone session
+    jq -s --argjson limit "$limit" --arg agent_name "$agent_name" '
+      reduce .[] as $line (
+        [];
+        if $line.type == "user" then
+          # User prompt or tool results
+          (($line.message.content // "") | if type == "string" then . else "" end) as $text_content |
+          if ($text_content | length) > 0 then
+            . + [{
+              timestamp: $line.timestamp,
+              event_type: "user_message",
+              label: "Task Prompt",
+              description: "Prompt from orchestrator",
+              attributes: { content: ($text_content | .[0:$limit]) }
+            }]
+          else
+            reduce (if ($line.message.content | type) == "array" then $line.message.content[] else empty end) as $item (.;
+              if $item.type == "tool_result" then
+                . + [{
+                  timestamp: $line.timestamp,
+                  event_type: "tool_call",
+                  label: "Tool Result",
+                  description: "Received tool result",
+                  attributes: {
+                    tool_use_id: $item.tool_use_id,
+                    tool_output: (($item.content | tostring) | .[0:$limit]),
+                    success: true
+                  }
+                }]
+              else . end
+            )
+          end
+        elif $line.type == "assistant" then
+          reduce ($line.message.content // [])[] as $item (.;
+            if $item.type == "text" then
+              . + [{
+                timestamp: $line.timestamp,
+                event_type: "assistant_message",
+                label: "Assistant Message",
+                description: "Agent response",
+                attributes: { content: ($item.text | .[0:$limit]) }
+              }]
+            elif $item.type == "tool_use" then
+              . + [{
+                timestamp: $line.timestamp,
+                event_type: "tool_call",
+                label: ("Tool Call: " + $item.name),
+                description: ("Executing " + $item.name),
+                attributes: {
+                  tool_name: $item.name,
+                  tool_use_id: $item.id,
+                  tool_input: (($item.input | tojson) | .[0:$limit]),
+                  success: true
+                }
+              }]
+            else . end
+          )
+        else . end
+      )
+      # Bookend with session start/end
+      | (.[0].timestamp // (now | todate)) as $start_ts
+      | (.[-1].timestamp // (now | todate)) as $end_ts
+      | [{
+          timestamp: $start_ts,
+          event_type: "system_message",
+          label: "Session Started",
+          description: ("Subagent " + $agent_name + " session started"),
+          attributes: { content: ("Subagent session initialized for " + $agent_name) }
+        }]
+        + .
+        + [{
+          timestamp: $end_ts,
+          event_type: "system_message",
+          label: "Session Ended",
+          description: ("Subagent " + $agent_name + " session completed"),
+          attributes: { content: "Subagent session ended" }
+        }]
+    ' "$agent_file"
+  fi
+}
 
 for f in "$TRANSCRIPT_DIR"/agent-*.jsonl; do
   [ -f "$f" ] || continue
@@ -53,83 +215,60 @@ for f in "$TRANSCRIPT_DIR"/agent-*.jsonl; do
   # Skip warmup or empty prompts
   [ -z "$PROMPT_KEY" ] || [ "$PROMPT_KEY" = "Warmup" ] && continue
 
-  log "Parsing subagent transcript: $f (prompt: ${PROMPT_KEY:0:60}...)"
+  # We don't know the agent name yet (it comes from the main transcript's Task tool_use).
+  # Scan the main transcript to find the Task tool_use whose prompt starts with this key.
+  AGENT_NAME=$(jq -r --arg pk "$PROMPT_KEY" '
+    .message.content[]?
+    | select(.type == "tool_use" and .name == "Task")
+    | select((.input.prompt // "") | .[0:200] == $pk)
+    | (.input.subagent_type // .input.name // "unknown")
+  ' "$TRANSCRIPT_PATH" | head -1)
+  [ -z "$AGENT_NAME" ] && AGENT_NAME="unknown"
 
-  SUB_EVENTS=$(jq -s --argjson limit "$FIELD_LIMIT" '
-    # Extract agent name from the first line metadata if available
-    (.[0].agentId // "subagent") as $agent_id |
+  log "Parsing subagent transcript: $f (agent: $AGENT_NAME, prompt: ${PROMPT_KEY:0:60}...)"
 
-    # Drop first line (user prompt → already in Agent Call) and last line (final summary → already in Agent Result)
-    .[1:-1]
-    | reduce .[] as $line (
-        [];
-        if $line.type == "assistant" then
-          reduce ($line.message.content // [])[] as $item (.;
-            if $item.type == "text" then
-              . + [{
-                timestamp: $line.timestamp,
-                event_type: "assistant_message",
-                label: "PLACEHOLDER_LABEL Reasoning",
-                description: "PLACEHOLDER_LABEL internal reasoning",
-                attributes: { content: ($item.text | .[0:$limit]) }
-              }]
-            elif $item.type == "tool_use" then
-              . + [{
-                timestamp: $line.timestamp,
-                event_type: "tool_call",
-                label: ("PLACEHOLDER_LABEL " + $item.name),
-                description: ("PLACEHOLDER_LABEL called " + $item.name),
-                attributes: {
-                  tool_name: $item.name,
-                  tool_use_id: $item.id,
-                  tool_input: (($item.input | tojson) | .[0:$limit]),
-                  success: true
-                }
-              }]
-            else . end
-          )
-        elif $line.type == "user" then
-          reduce ($line.message.content // [])[] as $item (.;
-            if $item.type == "tool_result" then
-              . + [{
-                timestamp: $line.timestamp,
-                event_type: "tool_call",
-                label: "PLACEHOLDER_LABEL Tool Result",
-                description: "PLACEHOLDER_LABEL received tool result",
-                attributes: {
-                  tool_use_id: $item.tool_use_id,
-                  tool_output: (($item.content | tostring) | .[0:$limit]),
-                  success: true
-                }
-              }]
-            else . end
-          )
-        else . end
-      )
-  ' "$f")
+  # Check for a dedicated Wayfound agent ID
+  SUBAGENT_WF_ID=$(resolve_agent_id "$AGENT_NAME")
 
-  SUBAGENT_EVENTS_MAP=$(echo "$SUBAGENT_EVENTS_MAP" | jq --arg key "$PROMPT_KEY" --argjson events "$SUB_EVENTS" '. + {($key): $events}')
+  if [ -n "$SUBAGENT_WF_ID" ]; then
+    # Route to separate Wayfound session
+    log "Routing $AGENT_NAME to separate Wayfound agent $SUBAGENT_WF_ID"
+    SUB_EVENTS=$(parse_subagent_transcript "$f" "full" "$FIELD_LIMIT" "$AGENT_NAME")
+    SEPARATE_AGENT_SESSIONS=$(echo "$SEPARATE_AGENT_SESSIONS" | jq \
+      --arg agent_id "$SUBAGENT_WF_ID" \
+      --arg agent_name "$AGENT_NAME" \
+      --argjson events "$SUB_EVENTS" \
+      '. + [{agent_id: $agent_id, agent_name: $agent_name, events: $events}]')
+  else
+    # Inline into orchestrator session
+    SUB_EVENTS=$(parse_subagent_transcript "$f" "internal" "$FIELD_LIMIT" "$AGENT_NAME")
+    SUBAGENT_EVENTS_MAP=$(echo "$SUBAGENT_EVENTS_MAP" | jq --arg key "$PROMPT_KEY" --argjson events "$SUB_EVENTS" '. + {($key): $events}')
+  fi
 done
 
-SUBAGENT_COUNT=$(echo "$SUBAGENT_EVENTS_MAP" | jq 'length')
-log "Pre-parsed events for $SUBAGENT_COUNT subagents"
+INLINE_COUNT=$(echo "$SUBAGENT_EVENTS_MAP" | jq 'length')
+SEPARATE_COUNT=$(echo "$SEPARATE_AGENT_SESSIONS" | jq 'length')
+log "Subagents: $INLINE_COUNT inlined, $SEPARATE_COUNT routed to separate sessions"
 
 # ---------------------------------------------------------------------------
 # Main transcript → Wayfound events.
 #
-# For subagent (Task) tool_uses we emit agent_call events. When we encounter
-# the corresponding tool_result (Agent Result), we splice in the pre-parsed
-# subagent internal events right before it, giving full visibility into what
-# each subagent did.
+# For subagent (Task) tool_uses we emit agent_call events. The orchestrator
+# ALWAYS keeps Agent Call and Agent Result events for every subagent.
 #
-# The PLACEHOLDER_LABEL in subagent events gets replaced with the resolved
-# agent name (e.g. "[news-researcher]") so labels are clear in the Wayfound UI.
+# For subagents WITHOUT a dedicated agent ID, their internal events are
+# spliced in between Agent Call and Agent Result (inlined).
+#
+# For subagents WITH a dedicated agent ID, only Agent Call and Agent Result
+# appear in the orchestrator session; internal events go to the separate session.
+#
+# The PLACEHOLDER_LABEL in inlined subagent events gets replaced with the
+# resolved agent name (e.g. "[news-researcher]").
 # ---------------------------------------------------------------------------
 generate_events() {
   local limit=$1
   jq -s --argjson limit "$limit" --arg reason "$REASON" --argjson subagent_map "$SUBAGENT_EVENTS_MAP" '
 
-    # First pass: build events and track tool_uses
     reduce .[] as $line (
       {events: [], tool_uses: {}};
 
@@ -148,7 +287,7 @@ generate_events() {
           elif $item.type == "tool_result" then
             (.tool_uses[$item.tool_use_id] // {}) as $tu |
             if $tu.is_agent then
-              # Look up subagent internal events by prompt key
+              # Look up subagent internal events by prompt key (empty if routed separately)
               ($tu.prompt_key // "") as $pk |
               ($subagent_map[$pk] // []) as $sub_events |
               # Replace PLACEHOLDER_LABEL with actual agent name
@@ -157,7 +296,7 @@ generate_events() {
                 .label |= gsub("PLACEHOLDER_LABEL"; "[" + $aname + "]")
                 | .description |= gsub("PLACEHOLDER_LABEL"; "[" + $aname + "]")
               )) as $labeled_events |
-              # Splice subagent internal events, then add the Agent Result
+              # Splice subagent internal events (if any), then add the Agent Result
               .events += $labeled_events + [{
                 timestamp: $line.timestamp,
                 event_type: "agent_call",
@@ -253,6 +392,48 @@ generate_events() {
   ' "$TRANSCRIPT_PATH"
 }
 
+# ---------------------------------------------------------------------------
+# Post a session to Wayfound. Args: $1=agent_id, $2=events_json, $3=metadata_json
+# ---------------------------------------------------------------------------
+post_session() {
+  local agent_id=$1
+  local events=$2
+  local metadata=$3
+
+  local events_size
+  events_size=$(echo "$events" | wc -c | tr -d ' ')
+
+  # If over budget, shrink field limit proportionally and regenerate
+  # (only applies to main session; subagent sessions are smaller)
+  if [ "$events_size" -gt "$MAX_MESSAGES_BYTES" ]; then
+    log "WARNING: payload for $agent_id is ${events_size} bytes, exceeds limit"
+  fi
+
+  local response
+  response=$(curl -s -w "\n%{http_code}" -X POST "https://app.wayfound.ai/api/v2/sessions" \
+    -H "Authorization: Bearer ${WAYFOUND_API_KEY}" \
+    -H "Content-Type: application/json" \
+    -d "$(jq -n \
+      --arg agent_id "$agent_id" \
+      --argjson messages "$events" \
+      --argjson metadata "$metadata" \
+      '{
+        agentId: $agent_id,
+        metadata: $metadata,
+        messages: $messages
+      }'
+    )")
+
+  local http_code body
+  http_code=$(echo "$response" | tail -1)
+  body=$(echo "$response" | sed '$d')
+  log "POST to agent $agent_id: HTTP $http_code"
+  log "Response body: $(echo "$body" | head -c 500)"
+}
+
+# ---------------------------------------------------------------------------
+# Generate and post the orchestrator (main) session.
+# ---------------------------------------------------------------------------
 EVENTS=$(generate_events "$FIELD_LIMIT")
 EVENTS_SIZE=$(echo "$EVENTS" | wc -c | tr -d ' ')
 log "Events payload: ${EVENTS_SIZE} bytes (limit: ${MAX_MESSAGES_BYTES}, field_limit: ${FIELD_LIMIT})"
@@ -268,31 +449,44 @@ if [ "$EVENTS_SIZE" -gt "$MAX_MESSAGES_BYTES" ]; then
 fi
 
 EVENT_COUNT=$(echo "$EVENTS" | jq 'length')
-log "Generated $EVENT_COUNT events from transcript"
+log "Generated $EVENT_COUNT events for orchestrator session"
 
-# Single POST to Wayfound with all events
-RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "https://app.wayfound.ai/api/v2/sessions" \
-  -H "Authorization: Bearer ${WAYFOUND_API_KEY}" \
-  -H "Content-Type: application/json" \
-  -d "$(jq -n \
-    --arg agent_id "$WAYFOUND_AGENT_ID" \
+MAIN_METADATA=$(jq -n \
+  --arg sdk_session_id "$SESSION_ID" \
+  --arg cwd "$CWD" \
+  '{
+    sdk_session_id: $sdk_session_id,
+    source: "claude-agent-sdk",
+    cwd: $cwd
+  }')
+
+post_session "$WAYFOUND_AGENT_ID" "$EVENTS" "$MAIN_METADATA"
+
+# ---------------------------------------------------------------------------
+# Post separate subagent sessions (if any).
+# ---------------------------------------------------------------------------
+SEPARATE_COUNT=$(echo "$SEPARATE_AGENT_SESSIONS" | jq 'length')
+for (( i=0; i<SEPARATE_COUNT; i++ )); do
+  SUB_AGENT_ID=$(echo "$SEPARATE_AGENT_SESSIONS" | jq -r ".[$i].agent_id")
+  SUB_AGENT_NAME=$(echo "$SEPARATE_AGENT_SESSIONS" | jq -r ".[$i].agent_name")
+  SUB_EVENTS=$(echo "$SEPARATE_AGENT_SESSIONS" | jq ".[$i].events")
+
+  SUB_EVENT_COUNT=$(echo "$SUB_EVENTS" | jq 'length')
+  log "Posting $SUB_EVENT_COUNT events for subagent $SUB_AGENT_NAME → agent $SUB_AGENT_ID"
+
+  SUB_METADATA=$(jq -n \
     --arg sdk_session_id "$SESSION_ID" \
     --arg cwd "$CWD" \
-    --argjson messages "$EVENTS" \
+    --arg agent_name "$SUB_AGENT_NAME" \
     '{
-      agentId: $agent_id,
-      metadata: {
-        sdk_session_id: $sdk_session_id,
-        source: "claude-agent-sdk",
-        cwd: $cwd
-      },
-      messages: $messages
-    }'
-  )")
+      sdk_session_id: $sdk_session_id,
+      source: "claude-agent-sdk",
+      cwd: $cwd,
+      subagent_name: $agent_name,
+      parent_session_id: $sdk_session_id
+    }')
 
-HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-BODY=$(echo "$RESPONSE" | sed '$d')
-log "POST response: HTTP $HTTP_CODE"
-log "Response body: $(echo "$BODY" | head -c 500)"
+  post_session "$SUB_AGENT_ID" "$SUB_EVENTS" "$SUB_METADATA"
+done
 
 exit 0

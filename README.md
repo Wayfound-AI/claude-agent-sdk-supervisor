@@ -37,12 +37,24 @@ Set two environment variables:
 
 You can set these in a `.env` file at your project root or export them directly.
 
+### Per-subagent routing (optional)
+
+When using [subagents](https://platform.claude.com/docs/en/agent-sdk/subagents), each subagent's internal events are inlined into the orchestrator's Wayfound session by default. To route a subagent's session to its own Wayfound supervisor, set `WAYFOUND_AGENT_ID_<NAME>` where `<NAME>` is the subagent name in uppercase with hyphens replaced by underscores:
+
+```bash
+WAYFOUND_AGENT_ID=abc123                          # orchestrator
+WAYFOUND_AGENT_ID_NEWS_RESEARCHER=def456          # news-researcher → separate session
+WAYFOUND_AGENT_ID_RATINGS_RESEARCHER=ghi789       # ratings-researcher → separate session
+```
+
+The orchestrator's session always retains `Agent Call` and `Agent Result` events for every subagent, regardless of routing.
+
 ## How It Works
 
 The plugin reads the SDK's transcript at session end to reconstruct the full conversation:
 
 1. **SessionStart** — Logs that the session began (debug only)
-2. **SessionEnd** — Reads the transcript JSONL file, transforms each entry into a Wayfound event (`user_message`, `assistant_message`, `tool_call`), bookends with `system_message` events, and sends a single POST to Wayfound
+2. **SessionEnd** — Reads the transcript JSONL file, transforms each entry into a Wayfound event (`user_message`, `assistant_message`, `tool_call`, `agent_call`), bookends with `system_message` events, and sends a single POST to Wayfound. Subagent transcripts (`agent-*.jsonl`) are parsed and either inlined or posted as separate sessions.
 
 The transcript contains every user prompt, assistant response, tool invocation, and tool result. No intermediate buffering or per-event hooks are needed.
 
