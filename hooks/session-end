@@ -97,7 +97,8 @@ parse_subagent_transcript() {
       | reduce .[] as $line (
           [];
           if $line.type == "assistant" then
-            reduce ($line.message.content // [])[] as $item (.;
+            (($line.message.content // []) | if type == "array" then . else [{type: "text", text: .}] end) as $content_items |
+            reduce $content_items[] as $item (.;
               if $item.type == "text" then
                 . + [{
                   timestamp: $line.timestamp,
@@ -122,7 +123,8 @@ parse_subagent_transcript() {
               else . end
             )
           elif $line.type == "user" then
-            reduce ($line.message.content // [])[] as $item (.;
+            (($line.message.content // []) | if type == "array" then . else [{type: "text", text: .}] end) as $content_items |
+            reduce $content_items[] as $item (.;
               if $item.type == "tool_result" then
                 . + [{
                   timestamp: $line.timestamp,
@@ -174,7 +176,8 @@ parse_subagent_transcript() {
             )
           end
         elif $line.type == "assistant" then
-          reduce ($line.message.content // [])[] as $item (.;
+          (($line.message.content // []) | if type == "array" then . else [{type: "text", text: .}] end) as $content_items |
+          reduce $content_items[] as $item (.;
             if $item.type == "text" then
               . + [{
                 timestamp: $line.timestamp,
@@ -293,7 +296,8 @@ generate_events() {
       if $line.type == "queue-operation" then .
 
       elif $line.type == "user" then
-        reduce ($line.message.content // [])[] as $item (.;
+        (($line.message.content // []) | if type == "array" then . else [{type: "text", text: .}] end) as $content_items |
+        reduce $content_items[] as $item (.;
           if $item.type == "text" then
             .events += [{
               timestamp: $line.timestamp,
@@ -344,7 +348,8 @@ generate_events() {
         )
 
       elif $line.type == "assistant" then
-        reduce ($line.message.content // [])[] as $item (.;
+        (($line.message.content // []) | if type == "array" then . else [{type: "text", text: .}] end) as $content_items |
+        reduce $content_items[] as $item (.;
           if $item.type == "text" then
             .events += [{
               timestamp: $line.timestamp,
